@@ -121,30 +121,38 @@ def select_landmarks(
 
         # Distance from each cluster member to centroid
         dists_to_centroid = _mixed_dist_to_point(X_cluster, centroid, _is_cat, _ranges)
-
-        # Central: closest to centroid (most representative)
         sorted_by_dist = np.argsort(dists_to_centroid)
-        central_local = sorted_by_dist[:n_central]
 
-        # Boundary: farthest from centroid (near cluster edges)
-        if n_boundary > 0:
-            # From the remaining points, pick farthest from centroid
-            remaining = sorted_by_dist[n_central:]
-            if len(remaining) > n_boundary:
-                # Pick the farthest ones
-                boundary_local = remaining[-n_boundary:]
-            else:
-                boundary_local = remaining
-        else:
-            boundary_local = np.array([], dtype=int)
+        # --- Oversized candidate pools ---
+        # FIX: pools are deliberately larger than the final target count so that
+        # _farthest_first_subsample below has room to actually pick a diverse
+        # subset. Previously, central/boundary were sliced to exactly n_central/
+        # n_boundary points and then passed straight into farthest-first with
+        # target == len(candidates), which made the "n_cand <= target" guard
+        # always true and skipped the traversal entirely (random_state was a
+        # dead parameter for the "cluster_aware" strategy). Pattern mirrors the
+        # working notebook implementation (pool = max(target*5, target+5)).
+        pool_central = sorted_by_dist[: max(n_central * 5, n_central + 5)]
+        remaining = sorted_by_dist[len(pool_central):]
+        pool_boundary = (
+            remaining[-max(n_boundary * 5, n_boundary + 5):]
+            if n_boundary > 0 else np.array([], dtype=int)
+        )
 
-        selected_local = np.concatenate([central_local, boundary_local]).astype(int)
+        # --- Farthest-first refinement: pick target count from each pool ---
+        central_local = (
+            _farthest_first_subsample(X_cluster, pool_central, n_central, rng, _is_cat, _ranges)
+            if n_central > 0 else np.array([], dtype=int)
+        )
+        boundary_local = (
+            _farthest_first_subsample(X_cluster, pool_boundary, n_boundary, rng, _is_cat, _ranges)
+            if n_boundary > 0 else np.array([], dtype=int)
+        )
 
-        # --- Farthest-first refinement within selected ---
-        if len(selected_local) > 3:
-            selected_local = _farthest_first_subsample(
-                X_cluster, selected_local, len(selected_local), rng, _is_cat, _ranges
-            )
+        # De-duplicate in case oversized pools overlapped near the pool boundary
+        selected_local = np.array(
+            sorted(set(central_local.tolist()) | set(boundary_local.tolist())), dtype=int
+        )
 
         all_indices.extend(cluster_idx[selected_local].tolist())
         info["clusters"][int(k)] = {
