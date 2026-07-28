@@ -17,7 +17,7 @@ from .gower import _detect_feature_types, _gower_ranges, gower_distances_to_land
 from .landmarks import select_landmarks
 from .metrics import compute_lsil, compute_lnc_star
 
-__version__ = "0.2.0"
+__version__ = "1.0.0"
 
 
 def adaptive_landmark_count(n: int, K: int = 3, c: float = 3.0,
@@ -34,7 +34,8 @@ def adaptive_landmark_count(n: int, K: int = 3, c: float = 3.0,
 
 def lsil_score(X, labels, cat_features=None, c=3.0, cap_frac=0.2,
                central_ratio=0.8, random_state=42, agg_mode="topk",
-               topk=3, weighted=True, lnc_threshold=0.5) -> float:
+               topk=3, weighted=True, lnc_threshold=0.5,
+               pool_factor=5, pool_frac_cap=0.15) -> float:
     """
     Compute L-Sil score — drop-in replacement for silhouette_score.
 
@@ -44,18 +45,21 @@ def lsil_score(X, labels, cat_features=None, c=3.0, cap_frac=0.2,
     result = lsil_evaluate(X, labels, cat_features=cat_features, c=c,
                            cap_frac=cap_frac, central_ratio=central_ratio,
                            random_state=random_state, agg_mode=agg_mode,
-                           topk=topk, weighted=weighted, lnc_threshold=lnc_threshold)
+                           topk=topk, weighted=weighted, lnc_threshold=lnc_threshold,
+                           pool_factor=pool_factor, pool_frac_cap=pool_frac_cap)
     return result["lsil"]
 
 
 def lnc_star_score(X, labels, cat_features=None, c=3.0, cap_frac=0.2,
                    central_ratio=0.8, random_state=42, k_neighbors=10,
-                   alpha=0.7, weighted=True) -> float:
+                   alpha=0.7, weighted=True,
+                   pool_factor=5, pool_frac_cap=0.15) -> float:
     """Compute LNC* score (paper Eq. 6, default alpha=0.7)."""
     result = lsil_evaluate(X, labels, cat_features=cat_features, c=c,
                            cap_frac=cap_frac, central_ratio=central_ratio,
                            random_state=random_state, k_neighbors=k_neighbors,
-                           alpha=alpha, weighted=weighted)
+                           alpha=alpha, weighted=weighted,
+                           pool_factor=pool_factor, pool_frac_cap=pool_frac_cap)
     return result["lnc_star"]
 
 
@@ -63,6 +67,7 @@ def lsil_evaluate(X, labels, cat_features=None, c=3.0, cap_frac=0.2,
                   central_ratio=0.8, random_state=42, lnc_threshold=0.5,
                   k_neighbors=10, alpha=0.7, agg_mode="topk", topk=3,
                   weighted=True, strategy="cluster_aware",
+                  pool_factor=5, pool_frac_cap=0.15,
                   return_per_point=False) -> Dict[str, Any]:
     """
     Full L-Sil + LNC* evaluation with paper-aligned defaults.
@@ -79,6 +84,13 @@ def lsil_evaluate(X, labels, cat_features=None, c=3.0, cap_frac=0.2,
     topk : int — paper r in {3,5}, default 3
     alpha : float — LNC* weight (default 0.7, paper)
     weighted : bool — cluster-size weighted mean (default True)
+    pool_factor : int — candidate pool multiplier for farthest-first (default 5).
+        pool_factor <= 0 reproduces the pre-patch degenerate pool (no
+        diversification, random_state inert); retained for ablation only.
+    pool_frac_cap : float — upper bound on candidate pool as a fraction of
+        cluster size (default 0.15). Bounds pool coverage from above so that
+        selection behaviour stays comparable across dataset scales. Not to be
+        confused with cap_frac, which bounds the landmark COUNT.
 
     Returns
     -------
@@ -101,6 +113,7 @@ def lsil_evaluate(X, labels, cat_features=None, c=3.0, cap_frac=0.2,
     lm_idx, lm_labels, lm_info = select_landmarks(
         X, labels, n_landmarks=n_lm, central_ratio=central_ratio,
         random_state=random_state, strategy=strategy,
+        pool_factor=pool_factor, pool_frac_cap=pool_frac_cap,
         _is_cat=is_cat, _ranges=ranges)
     t_lm = time.time() - t_lm
 
@@ -133,6 +146,8 @@ def lsil_evaluate(X, labels, cat_features=None, c=3.0, cap_frac=0.2,
         "strategy": strategy, "c": c, "cap_frac": cap_frac,
         "central_ratio": central_ratio, "agg_mode": agg_mode, "topk": topk,
         "alpha": alpha, "weighted": weighted,
+        "pool_factor": pool_factor, "pool_frac_cap": pool_frac_cap,
+        "random_state": random_state,
         "timing_s": {"landmark_selection": round(t_lm, 4),
                      "distance_cache": round(t_dist, 4),
                      "lsil_computation": round(t_ls, 4),
@@ -146,27 +161,69 @@ def lsil_evaluate(X, labels, cat_features=None, c=3.0, cap_frac=0.2,
     return result
 
 
-def gower_silhouette(X, labels, cat_features=None) -> float:
-    """Full Gower Silhouette — O(n²). For validation on small data only."""
+def gower_silhouette(X, labels, cat_features=None, block: int = 512) -> float:
+    """
+    Exact full Gower Silhouette, computed in row blocks.
+
+    Numerically identical to the previous implementation (which materialised the
+    full n x n matrix) but requires O(block * n) memory instead of O(n^2), so it
+    is tractable as a reference on datasets of tens of thousands of rows.
+    Categorical columns are mapped to integer codes first: on object dtype
+    the `!=` comparison falls back to per-element Python and dominates runtime.
+
+    Time complexity remains O(n^2 * p).
+    """
+    import gc
+
     X = np.asarray(X, dtype=object)
     labels = np.asarray(labels)
+    n, p = X.shape
+
     is_cat = _detect_feature_types(X, cat_features)
     ranges = _gower_ranges(X, is_cat)
-    D = gower_pairwise(X, is_cat, ranges)
-    n = X.shape[0]
-    unique_labels = np.unique(labels)
-    scores = np.zeros(n)
-    for i in range(n):
-        c = labels[i]
-        own = labels == c; own[i] = False
-        if own.sum() == 0: continue
-        a = D[i, own].mean()
-        b = np.inf
-        for k in unique_labels:
-            if k == c: continue
-            other = labels == k
-            if other.sum() == 0: continue
-            b = min(b, D[i, other].mean())
-        denom = max(a, b)
-        scores[i] = (b - a) / denom if denom > 0 else 0.0
+    num_idx = np.where(~is_cat)[0]
+    cat_idx = np.where(is_cat)[0]
+
+    Xn = X[:, num_idx].astype(np.float64) if len(num_idx) else np.zeros((n, 0))
+    Rn = np.maximum(ranges[num_idx].astype(np.float64), 1e-12) if len(num_idx) else np.zeros(0)
+    if len(cat_idx):
+        Xc = np.empty((n, len(cat_idx)), dtype=np.int32)
+        for j, k in enumerate(cat_idx):
+            # np.unique(..., return_inverse=True) gives codes in sorted order,
+            # equivalent to pd.factorize(sort=True) but numpy-only (keeps the
+            # package dependency-free beyond numpy).
+            Xc[:, j] = np.unique(X[:, k].astype(str), return_inverse=True)[1]
+    else:
+        Xc = np.zeros((n, 0), dtype=np.int32)
+
+    uniq = np.unique(labels)
+    K = len(uniq)
+    lab_code = np.searchsorted(uniq, labels)
+    counts = np.bincount(lab_code, minlength=K).astype(np.float64)
+
+    S = np.zeros((n, K), dtype=np.float64)
+    for s in range(0, n, block):
+        e = min(s + block, n)
+        D = np.zeros((e - s, n), dtype=np.float64)
+        for k in range(Xn.shape[1]):
+            D += np.abs(Xn[s:e, k][:, None] - Xn[None, :, k]) / Rn[k]
+        for k in range(Xc.shape[1]):
+            D += (Xc[s:e, k][:, None] != Xc[None, :, k])
+        D /= p
+        for cc in range(K):
+            S[s:e, cc] = D[:, lab_code == cc].sum(axis=1)
+        del D
+    gc.collect()
+
+    own = S[np.arange(n), lab_code]
+    n_own = counts[lab_code]
+    with np.errstate(invalid="ignore", divide="ignore"):
+        a = np.where(n_own > 1, own / np.maximum(n_own - 1, 1), 0.0)
+        Sb = S / counts[None, :]
+    Sb[np.arange(n), lab_code] = np.inf
+    b = Sb.min(axis=1)
+
+    denom = np.maximum(a, b)
+    scores = np.where(denom > 0, (b - a) / denom, 0.0)
+    scores[n_own <= 1] = 0.0
     return float(scores.mean())

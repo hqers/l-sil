@@ -3,7 +3,7 @@ lsil — Landmark-Based Evaluation Metrics for Mixed-Type Clustering
 ==================================================================
 
 Paper-aligned implementation. Defaults: c=3 (√n law), topk=3, alpha=0.7,
-cluster-size weighted mean.
+cluster-size weighted mean, pool_frac_cap=0.15 (scale-invariant candidate pool).
 
 Quick Start:
     from lsil import lsil_score
@@ -24,6 +24,6 @@ GitHub: https://github.com/hqers/l-sil
 from .api import (lsil_score, lnc_star_score, lsil_evaluate,
                   gower_silhouette, adaptive_landmark_count)
 
-__version__ = "0.2.0"
+__version__ = "1.0.0"
 __all__ = ["lsil_score", "lnc_star_score", "lsil_evaluate",
            "gower_silhouette", "adaptive_landmark_count"]

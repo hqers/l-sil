@@ -1,0 +1,255 @@
+--- /mnt/user-data/uploads/landmarks.py	2026-07-27 16:55:48.254775000 +0000
++++ build/landmarks.py	2026-07-27 16:56:44.129249719 +0000
+@@ -20,6 +20,8 @@
+     central_ratio: float = 0.8,
+     random_state: Optional[int] = None,
+     strategy: str = "cluster_aware",
++    pool_factor: int = 5,
++    pool_frac_cap: Optional[float] = 0.15,
+     _dist_func=None,
+     _is_cat=None,
+     _ranges=None,
+@@ -44,6 +46,22 @@
+         Random seed for reproducibility.
+     strategy : str
+         "cluster_aware" (default), "random", or "kcenter".
++        NOTE: "kcenter" currently performs uniform random selection within each
++        cluster, not k-center/farthest-first. Kept for baseline compatibility.
++    pool_factor : int
++        Candidate pool size multiplier: pool = max(target*pool_factor, target+5).
++        pool_factor <= 0 gives the degenerate pool == target, which reproduces
++        the pre-patch behaviour where farthest-first was a no-op and
++        random_state had no effect (retained for ablation/reproducibility).
++    pool_frac_cap : float, optional
++        Upper bound on the candidate pool as a fraction of the cluster size.
++        Without it, pool coverage is approximately
++            pool / n_cluster ~ pool_factor * central_ratio * c / sqrt(n),
++        i.e. it decays as 1/sqrt(n): on small datasets the pool swallowed
++        70-100% of the cluster and the central/boundary distinction collapsed.
++        Default 0.15 bounds coverage from above and keeps the selection
++        behaviour comparable across dataset scales, without changing the
++        O(n) cost of the selection step. Set None for the uncapped rule.
+     _dist_func : callable, optional
+         Distance function for farthest-first. If None, uses Gower.
+     _is_cat : array, optional
+@@ -132,11 +150,21 @@
+         # always true and skipped the traversal entirely (random_state was a
+         # dead parameter for the "cluster_aware" strategy). Pattern mirrors the
+         # working notebook implementation (pool = max(target*5, target+5)).
+-        pool_central = sorted_by_dist[: max(n_central * 5, n_central + 5)]
++        n_cluster = len(sorted_by_dist)
++
++        def _pool_size(target: int) -> int:
++            if pool_factor <= 0:
++                return int(min(target, n_cluster))
++            size = max(target * pool_factor, target + 5)
++            if pool_frac_cap is not None:
++                size = min(size, max(target, int(np.ceil(pool_frac_cap * n_cluster))))
++            return int(min(size, n_cluster))
++
++        pool_central = sorted_by_dist[: _pool_size(n_central)]
+         remaining = sorted_by_dist[len(pool_central):]
+         pool_boundary = (
+-            remaining[-max(n_boundary * 5, n_boundary + 5):]
+-            if n_boundary > 0 else np.array([], dtype=int)
++            remaining[-min(_pool_size(n_boundary), len(remaining)):]
++            if (n_boundary > 0 and len(remaining) > 0) else np.array([], dtype=int)
+         )
+ 
+         # --- Farthest-first refinement: pick target count from each pool ---
+@@ -159,10 +187,23 @@
+             "total": len(selected_local),
+             "central": len(central_local),
+             "boundary": len(boundary_local),
++            "n_cluster": int(n_cluster),
++            "pool_central": int(len(pool_central)),
++            "pool_boundary": int(len(pool_boundary)),
++            "coverage_central": float(len(pool_central) / max(n_cluster, 1)),
+         }
+ 
+     landmark_indices = np.array(all_indices, dtype=int)
+     info["n_landmarks"] = len(landmark_indices)
++    info["pool_factor"] = pool_factor
++    info["pool_frac_cap"] = pool_frac_cap
++    if info.get("clusters"):
++        _cov = [v["coverage_central"] for v in info["clusters"].values()
++                if "coverage_central" in v]
++        if _cov:
++            info["coverage_central_min"] = float(min(_cov))
++            info["coverage_central_mean"] = float(sum(_cov) / len(_cov))
++            info["coverage_central_max"] = float(max(_cov))
+ 
+     return landmark_indices, labels[landmark_indices], info
+ 
+--- /mnt/user-data/uploads/api.py	2026-07-27 16:55:48.273142000 +0000
++++ build/api.py	2026-07-27 16:57:08.128212938 +0000
+@@ -17,7 +17,7 @@
+ from .landmarks import select_landmarks
+ from .metrics import compute_lsil, compute_lnc_star
+ 
+-__version__ = "0.2.0"
++__version__ = "1.0.0"
+ 
+ 
+ def adaptive_landmark_count(n: int, K: int = 3, c: float = 3.0,
+@@ -34,7 +34,8 @@
+ 
+ def lsil_score(X, labels, cat_features=None, c=3.0, cap_frac=0.2,
+                central_ratio=0.8, random_state=42, agg_mode="topk",
+-               topk=3, weighted=True, lnc_threshold=0.5) -> float:
++               topk=3, weighted=True, lnc_threshold=0.5,
++               pool_factor=5, pool_frac_cap=0.15) -> float:
+     """
+     Compute L-Sil score — drop-in replacement for silhouette_score.
+ 
+@@ -44,18 +45,21 @@
+     result = lsil_evaluate(X, labels, cat_features=cat_features, c=c,
+                            cap_frac=cap_frac, central_ratio=central_ratio,
+                            random_state=random_state, agg_mode=agg_mode,
+-                           topk=topk, weighted=weighted, lnc_threshold=lnc_threshold)
++                           topk=topk, weighted=weighted, lnc_threshold=lnc_threshold,
++                           pool_factor=pool_factor, pool_frac_cap=pool_frac_cap)
+     return result["lsil"]
+ 
+ 
+ def lnc_star_score(X, labels, cat_features=None, c=3.0, cap_frac=0.2,
+                    central_ratio=0.8, random_state=42, k_neighbors=10,
+-                   alpha=0.7, weighted=True) -> float:
++                   alpha=0.7, weighted=True,
++                   pool_factor=5, pool_frac_cap=0.15) -> float:
+     """Compute LNC* score (paper Eq. 6, default alpha=0.7)."""
+     result = lsil_evaluate(X, labels, cat_features=cat_features, c=c,
+                            cap_frac=cap_frac, central_ratio=central_ratio,
+                            random_state=random_state, k_neighbors=k_neighbors,
+-                           alpha=alpha, weighted=weighted)
++                           alpha=alpha, weighted=weighted,
++                           pool_factor=pool_factor, pool_frac_cap=pool_frac_cap)
+     return result["lnc_star"]
+ 
+ 
+@@ -63,6 +67,7 @@
+                   central_ratio=0.8, random_state=42, lnc_threshold=0.5,
+                   k_neighbors=10, alpha=0.7, agg_mode="topk", topk=3,
+                   weighted=True, strategy="cluster_aware",
++                  pool_factor=5, pool_frac_cap=0.15,
+                   return_per_point=False) -> Dict[str, Any]:
+     """
+     Full L-Sil + LNC* evaluation with paper-aligned defaults.
+@@ -79,6 +84,13 @@
+     topk : int — paper r in {3,5}, default 3
+     alpha : float — LNC* weight (default 0.7, paper)
+     weighted : bool — cluster-size weighted mean (default True)
++    pool_factor : int — candidate pool multiplier for farthest-first (default 5).
++        pool_factor <= 0 reproduces the pre-patch degenerate pool (no
++        diversification, random_state inert); retained for ablation only.
++    pool_frac_cap : float — upper bound on candidate pool as a fraction of
++        cluster size (default 0.15). Bounds pool coverage from above so that
++        selection behaviour stays comparable across dataset scales. Not to be
++        confused with cap_frac, which bounds the landmark COUNT.
+ 
+     Returns
+     -------
+@@ -101,6 +113,7 @@
+     lm_idx, lm_labels, lm_info = select_landmarks(
+         X, labels, n_landmarks=n_lm, central_ratio=central_ratio,
+         random_state=random_state, strategy=strategy,
++        pool_factor=pool_factor, pool_frac_cap=pool_frac_cap,
+         _is_cat=is_cat, _ranges=ranges)
+     t_lm = time.time() - t_lm
+ 
+@@ -133,6 +146,8 @@
+         "strategy": strategy, "c": c, "cap_frac": cap_frac,
+         "central_ratio": central_ratio, "agg_mode": agg_mode, "topk": topk,
+         "alpha": alpha, "weighted": weighted,
++        "pool_factor": pool_factor, "pool_frac_cap": pool_frac_cap,
++        "random_state": random_state,
+         "timing_s": {"landmark_selection": round(t_lm, 4),
+                      "distance_cache": round(t_dist, 4),
+                      "lsil_computation": round(t_ls, 4),
+@@ -146,27 +161,67 @@
+     return result
+ 
+ 
+-def gower_silhouette(X, labels, cat_features=None) -> float:
+-    """Full Gower Silhouette — O(n²). For validation on small data only."""
++def gower_silhouette(X, labels, cat_features=None, block: int = 512) -> float:
++    """
++    Exact full Gower Silhouette, computed in row blocks.
++
++    Numerically identical to the previous implementation (which materialised the
++    full n x n matrix) but requires O(block * n) memory instead of O(n^2), so it
++    is tractable as a reference on datasets of tens of thousands of rows.
++    Categorical columns are factorised to integer codes first: on object dtype
++    the `!=` comparison falls back to per-element Python and dominates runtime.
++
++    Time complexity remains O(n^2 * p).
++    """
++    import gc
++    import pandas as pd
++
+     X = np.asarray(X, dtype=object)
+     labels = np.asarray(labels)
++    n, p = X.shape
++
+     is_cat = _detect_feature_types(X, cat_features)
+     ranges = _gower_ranges(X, is_cat)
+-    D = gower_pairwise(X, is_cat, ranges)
+-    n = X.shape[0]
+-    unique_labels = np.unique(labels)
+-    scores = np.zeros(n)
+-    for i in range(n):
+-        c = labels[i]
+-        own = labels == c; own[i] = False
+-        if own.sum() == 0: continue
+-        a = D[i, own].mean()
+-        b = np.inf
+-        for k in unique_labels:
+-            if k == c: continue
+-            other = labels == k
+-            if other.sum() == 0: continue
+-            b = min(b, D[i, other].mean())
+-        denom = max(a, b)
+-        scores[i] = (b - a) / denom if denom > 0 else 0.0
++    num_idx = np.where(~is_cat)[0]
++    cat_idx = np.where(is_cat)[0]
++
++    Xn = X[:, num_idx].astype(np.float64) if len(num_idx) else np.zeros((n, 0))
++    Rn = np.maximum(ranges[num_idx].astype(np.float64), 1e-12) if len(num_idx) else np.zeros(0)
++    if len(cat_idx):
++        Xc = np.empty((n, len(cat_idx)), dtype=np.int32)
++        for j, k in enumerate(cat_idx):
++            Xc[:, j] = pd.factorize(X[:, k].astype(str), sort=True)[0]
++    else:
++        Xc = np.zeros((n, 0), dtype=np.int32)
++
++    uniq = np.unique(labels)
++    K = len(uniq)
++    lab_code = np.searchsorted(uniq, labels)
++    counts = np.bincount(lab_code, minlength=K).astype(np.float64)
++
++    S = np.zeros((n, K), dtype=np.float64)
++    for s in range(0, n, block):
++        e = min(s + block, n)
++        D = np.zeros((e - s, n), dtype=np.float64)
++        for k in range(Xn.shape[1]):
++            D += np.abs(Xn[s:e, k][:, None] - Xn[None, :, k]) / Rn[k]
++        for k in range(Xc.shape[1]):
++            D += (Xc[s:e, k][:, None] != Xc[None, :, k])
++        D /= p
++        for cc in range(K):
++            S[s:e, cc] = D[:, lab_code == cc].sum(axis=1)
++        del D
++    gc.collect()
++
++    own = S[np.arange(n), lab_code]
++    n_own = counts[lab_code]
++    with np.errstate(invalid="ignore", divide="ignore"):
++        a = np.where(n_own > 1, own / np.maximum(n_own - 1, 1), 0.0)
++        Sb = S / counts[None, :]
++    Sb[np.arange(n), lab_code] = np.inf
++    b = Sb.min(axis=1)
++
++    denom = np.maximum(a, b)
++    scores = np.where(denom > 0, (b - a) / denom, 0.0)
++    scores[n_own <= 1] = 0.0
+     return float(scores.mean())

@@ -20,6 +20,8 @@ def select_landmarks(
     central_ratio: float = 0.8,
     random_state: Optional[int] = None,
     strategy: str = "cluster_aware",
+    pool_factor: int = 5,
+    pool_frac_cap: Optional[float] = 0.15,
     _dist_func=None,
     _is_cat=None,
     _ranges=None,
@@ -44,6 +46,22 @@ def select_landmarks(
         Random seed for reproducibility.
     strategy : str
         "cluster_aware" (default), "random", or "kcenter".
+        NOTE: "kcenter" currently performs uniform random selection within each
+        cluster, not k-center/farthest-first. Kept for baseline compatibility.
+    pool_factor : int
+        Candidate pool size multiplier: pool = max(target*pool_factor, target+5).
+        pool_factor <= 0 gives the degenerate pool == target, which reproduces
+        the pre-patch behaviour where farthest-first was a no-op and
+        random_state had no effect (retained for ablation/reproducibility).
+    pool_frac_cap : float, optional
+        Upper bound on the candidate pool as a fraction of the cluster size.
+        Without it, pool coverage is approximately
+            pool / n_cluster ~ pool_factor * central_ratio * c / sqrt(n),
+        i.e. it decays as 1/sqrt(n): on small datasets the pool swallowed
+        70-100% of the cluster and the central/boundary distinction collapsed.
+        Default 0.15 bounds coverage from above and keeps the selection
+        behaviour comparable across dataset scales, without changing the
+        O(n) cost of the selection step. Set None for the uncapped rule.
     _dist_func : callable, optional
         Distance function for farthest-first. If None, uses Gower.
     _is_cat : array, optional
@@ -132,11 +150,21 @@ def select_landmarks(
         # always true and skipped the traversal entirely (random_state was a
         # dead parameter for the "cluster_aware" strategy). Pattern mirrors the
         # working notebook implementation (pool = max(target*5, target+5)).
-        pool_central = sorted_by_dist[: max(n_central * 5, n_central + 5)]
+        n_cluster = len(sorted_by_dist)
+
+        def _pool_size(target: int) -> int:
+            if pool_factor <= 0:
+                return int(min(target, n_cluster))
+            size = max(target * pool_factor, target + 5)
+            if pool_frac_cap is not None:
+                size = min(size, max(target, int(np.ceil(pool_frac_cap * n_cluster))))
+            return int(min(size, n_cluster))
+
+        pool_central = sorted_by_dist[: _pool_size(n_central)]
         remaining = sorted_by_dist[len(pool_central):]
         pool_boundary = (
-            remaining[-max(n_boundary * 5, n_boundary + 5):]
-            if n_boundary > 0 else np.array([], dtype=int)
+            remaining[-min(_pool_size(n_boundary), len(remaining)):]
+            if (n_boundary > 0 and len(remaining) > 0) else np.array([], dtype=int)
         )
 
         # --- Farthest-first refinement: pick target count from each pool ---
@@ -159,10 +187,23 @@ def select_landmarks(
             "total": len(selected_local),
             "central": len(central_local),
             "boundary": len(boundary_local),
+            "n_cluster": int(n_cluster),
+            "pool_central": int(len(pool_central)),
+            "pool_boundary": int(len(pool_boundary)),
+            "coverage_central": float(len(pool_central) / max(n_cluster, 1)),
         }
 
     landmark_indices = np.array(all_indices, dtype=int)
     info["n_landmarks"] = len(landmark_indices)
+    info["pool_factor"] = pool_factor
+    info["pool_frac_cap"] = pool_frac_cap
+    if info.get("clusters"):
+        _cov = [v["coverage_central"] for v in info["clusters"].values()
+                if "coverage_central" in v]
+        if _cov:
+            info["coverage_central_min"] = float(min(_cov))
+            info["coverage_central_mean"] = float(sum(_cov) / len(_cov))
+            info["coverage_central_max"] = float(max(_cov))
 
     return landmark_indices, labels[landmark_indices], info
 
