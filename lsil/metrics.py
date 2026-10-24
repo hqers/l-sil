@@ -11,7 +11,7 @@ Reference: Pratama, Lubis, Sembiring (2026).
 """
 
 import numpy as np
-from typing import Tuple
+from typing import Optional, Tuple
 
 
 def compute_lsil(
@@ -21,6 +21,7 @@ def compute_lsil(
     agg_mode: str = "topk",
     topk: int = 3,
     weighted: bool = True,
+    landmark_indices: Optional[np.ndarray] = None,
 ) -> Tuple[float, np.ndarray]:
     """
     Compute L-Sil from precomputed point-to-landmark distances (paper Eq. 2-3).
@@ -37,6 +38,11 @@ def compute_lsil(
     agg_mode : str — "topk" (paper default) | "mean" | "min"
     topk : int — paper r in {3,5}, default 3
     weighted : bool — cluster-size weighted mean (default True)
+    landmark_indices : array (m,), optional — row index in X of each landmark.
+        When given, only the landmark that IS observation i is excluded from
+        a_L(i) (the paper's l != x). Exact duplicates of i that were selected
+        as landmarks are kept, as in the full Silhouette. When omitted, the
+        legacy rule (drop every zero distance) is used for backward compatibility.
 
     Returns
     -------
@@ -44,6 +50,9 @@ def compute_lsil(
     per_sample : array (n,)
     """
     n, m = D_to_landmarks.shape
+    self_col = None
+    if landmark_indices is not None:
+        self_col = {int(r): j for j, r in enumerate(np.asarray(landmark_indices))}
     unique_labels = np.unique(labels)
     lm_masks = {k: np.where(landmark_labels == k)[0] for k in unique_labels}
 
@@ -60,9 +69,15 @@ def compute_lsil(
         dists = D_to_landmarks[i]
 
         own_idx = lm_masks.get(c, np.array([], dtype=int))
-        own_dists = dists[own_idx]
-        own_nonzero = own_dists[own_dists > 1e-12]
-        if len(own_nonzero) == 0:
+        if self_col is not None:
+            j_self = self_col.get(i)
+            if j_self is not None:
+                own_idx = own_idx[own_idx != j_self]
+            own_nonzero = dists[own_idx]
+        else:
+            own_dists = dists[own_idx]
+            own_nonzero = own_dists[own_dists > 1e-12]
+        if len(own_nonzero) == 0 and self_col is None:
             own_nonzero = own_dists if len(own_dists) > 0 else None
         if own_nonzero is None or len(own_nonzero) == 0:
             per_sample[i] = 0.0

@@ -125,7 +125,8 @@ def lsil_evaluate(X, labels, cat_features=None, c=3.0, cap_frac=0.2,
     # L-Sil (paper Eq. 2-3)
     t_ls = time.time()
     lsil_val, per_point = compute_lsil(D, labels, lm_labels,
-                                        agg_mode=agg_mode, topk=topk, weighted=weighted)
+                                        agg_mode=agg_mode, topk=topk, weighted=weighted,
+                                        landmark_indices=lm_idx)
     t_ls = time.time() - t_ls
 
     # LNC* (paper Eq. 6)

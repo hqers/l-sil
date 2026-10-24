@@ -24,6 +24,6 @@ GitHub: https://github.com/hqers/l-sil
 from .api import (lsil_score, lnc_star_score, lsil_evaluate,
                   gower_silhouette, adaptive_landmark_count)
 
-__version__ = "1.0.0"
+__version__ = "1.0.1"
 __all__ = ["lsil_score", "lnc_star_score", "lsil_evaluate",
            "gower_silhouette", "adaptive_landmark_count"]
